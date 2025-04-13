@@ -1,0 +1,66 @@
+version: 2
+
+sources:
+  - name: staging
+    database: "{{ target.database }}"
+    schema: fuel_n_fleet
+    tables:
+      - name: fuel_type_data
+        description: "Raw fuel type data from source with column misalignment"
+        columns:
+          - name: unique_row_id
+            description: "Unique identifier for the row"
+            tests:
+              - not_null
+              - unique
+          - name: registrations
+            description: "Number of registrations"
+      - name: vehicle_category_data
+        description: "Raw vehicle category data with similar issues"
+        columns:
+          - name: unique_row_id
+            description: "Unique identifier for the row"
+            tests:
+              - not_null
+              - unique
+          - name: registrations
+            description: "Number of registrations"
+
+models:
+  - name: stg_fuel_type_data
+    description: >
+      Cleaned and transformed fuel type registration data with corrected columns, parsed reg_date,
+      and normalized category/type values.
+    columns:
+      - name: unique_row_id
+        tests:
+          - not_null
+          - unique
+      - name: category
+        description: "Category of the registration, expected to always be 'Fuel'."
+        tests:
+          - accepted_values:
+              values: ['Fuel']
+      - name: reg_date
+        description: "Parsed date from month and year"
+        tests:
+          - not_null
+
+  - name: stg_vehicle_category_data
+    description: >
+      Cleaned and transformed vehicle category registration data with corrected columns, parsed reg_date,
+      and normalized category/type values.
+    columns:
+      - name: unique_row_id
+        tests:
+          - not_null
+          - unique
+      - name: category
+        description: "Category of the registration, expected to always be 'Vehicle Category'."
+        tests:
+          - accepted_values:
+              values: ['Vehicle Category']
+      - name: reg_date
+        description: "Parsed date from month and year"
+        tests:
+          - not_null

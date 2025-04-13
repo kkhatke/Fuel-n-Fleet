@@ -1,0 +1,21 @@
+version: 2
+
+models:
+  - name: fact_registrations
+    description: >
+      Unified fact table combining all fuel type and vehicle category registration data.
+      Includes registration type, category, date, and location.
+    columns:
+      - name: unique_row_id
+        description: "Unique row identifier"
+      - name: reg_date
+        description: "Registration date parsed from month and year"
+      - name: category
+        description: "Standardized category of registration"
+        tests:
+          - accepted_values:
+              values: ['Fuel', 'Vehicle Category']
+      - name: type
+        description: "Cleaned and title-cased type of fuel or vehicle"
+      - name: registrations
+        description: "Number of registrations"

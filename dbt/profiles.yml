@@ -1,0 +1,14 @@
+fuel_n_fleet:
+  outputs:
+    dev:
+      dataset: fuel_n_fleet
+      job_execution_timeout_seconds: 300
+      job_retries: 1
+      keyfile: D:\project\FueLnFleet-Trends\my-creds.json
+      location: US
+      method: service-account
+      priority: interactive
+      project: dtc-de-project-454809
+      threads: 4
+      type: bigquery
+  target: dev

@@ -1,0 +1,25 @@
+version: 2
+
+macros:
+  - name: add_date
+    returns: date
+    description: >
+      This macro receives a year, month and returns the date in the format Jan-2023.
+    arguments:
+      - name: year
+        type: string
+        description: > 
+          The year in the format YYYY
+      - name: month
+        type: string
+        description: >
+          The month in the format Jan, Feb, etc.
+
+  - name: titlecase
+    description: >
+      Converts a given string column to title case (e.g., "CNG ONLY" → "Cng Only").
+    arguments:
+      - name: column_name
+        type: string
+        description: >
+          The column to convert to title case.

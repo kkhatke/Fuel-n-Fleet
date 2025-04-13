@@ -1,0 +1,673 @@
+id: scrape_vahan_registrations_scheduled
+namespace: de-project
+description: |
+  The Data Scraper for Vehicle Registrations from https://vahan.parivahan.gov.in/vahan4dashboard/vahan/dashboardview.xhtml
+
+concurrency:
+  limit: 3
+
+inputs:
+  - id: category
+    type: SELECT
+    displayName: Select Category
+    values: [vehicle_category, fuel]
+  - id: year
+    type: STRING
+    displayName: Year (for manual run only)
+    required: false
+  - id: month
+    type: STRING
+    displayName: Month (e.g. JAN, FEB — for manual run only)
+    required: false
+  - id: scrape_method
+    type: SELECT
+    displayName: Choose Scraping Method
+    values: [Sequential, Parallel]
+    defaults: Parallel
+
+variables:
+  file: "{{inputs.category}}_reg_{{ (trigger.date is defined ? (trigger.date | date('MMM') | upper) : 'JAN') }}-{{ (trigger.date is defined ? (trigger.date | date('yyyy')) : '2024') }}.csv"
+  gcs_file: "gs://{{kv('GCP_BUCKET_NAME')}}/{{vars.file}}"
+  table: "{{kv('GCP_DATASET')}}.{{inputs.category}}_reg_{{ (trigger.date is defined ? (trigger.date | date('MMM') | lower) : 'jan') }}_{{ (trigger.date is defined ? (trigger.date | date('yyyy')) : '2024') }}"
+
+tasks:
+  - id: set_label
+    type: io.kestra.plugin.core.execution.Labels
+    labels:
+      file: "{{render(vars.file)}}"
+      category: "{{inputs.category}}"
+
+  - id: scrape
+    type: io.kestra.plugin.scripts.python.Script
+    taskRunner:
+        type: io.kestra.plugin.scripts.runner.docker.Docker
+    containerImage: ghcr.io/kestra-io/polars:latest
+    beforeCommands:
+      - pip install pytest-playwright tqdm kestra
+      - playwright install chromium
+      - apt-get update -y
+      - apt-get install -y --no-install-recommends libatk1.0-0 libatk-bridge2.0-0 libcups2 libdbus-1-3 libgbm1 libasound2 libnspr4 libnss3 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libxkbcommon0 libatspi2.0-0
+    env:
+      KESTRA_INPUT_SCRAPE_METHOD: "{{inputs.scrape_method}}"
+      KESTRA_INPUT_YEAR: "{{trigger.date | date('yyyy') | default(inputs.year)}}"
+      KESTRA_INPUT_MONTH: "{{trigger.date | date('MMM') | upper | default(inputs.month)}}"
+      KESTRA_INPUT_CATEGORY: "{{inputs.category}}"
+    warningOnStdErr: false
+    script: |
+      from kestra import Kestra
+      from playwright.sync_api import sync_playwright
+      import pandas as pd
+      import time
+      import warnings
+      import concurrent.futures
+      from tqdm import tqdm
+      import os
+      import sys
+
+      warnings.filterwarnings("ignore", category=DeprecationWarning)
+      warnings.filterwarnings("ignore", category=FutureWarning)
+
+      def get_state_select_ele_id(page):
+        label = page.locator("label", has_text="All Vahan4 Running States (35/36)")
+        parent_div = label.locator("xpath=ancestor::div[contains(@class, 'ui-selectonemenu')]")
+        element_id = parent_div.get_attribute("id")
+        return element_id
+
+      def get_submit_btn_id(page):
+        button = page.locator("button.ui-button-icon-only", has=page.locator("span.fa-refresh"))
+        button_id = button.get_attribute("id")
+        return button_id  
+
+      def get_table_text(page, id):
+          """Extract data from table rows"""
+          rows = page.locator(f"#{id} tr")
+          data = []
+          row_count = rows.count()
+          for i in range(row_count):
+              try:
+                  fuel_type = rows.nth(i).locator("td").nth(0).inner_text().strip()
+                  registrations = rows.nth(i).locator("td").nth(1).inner_text().strip().replace(",", "")
+                  data.append((fuel_type, registrations))
+              except Exception as e:
+                  print(f"Skipping row {i} due to error: {e}")
+                  continue
+          return data
+
+      def clean_table(table, state, year, month, cat=None):
+          """Clean and format the extracted table data"""
+          columns = ["year", "month", "state", "type", "category", "registrations"]
+          table.columns = ["type", "registrations"]
+          if cat == "Vehicle Class":
+              for i in table.index:
+                  if "Non Transport" in table.loc[i, "type"]:
+                      table.loc[i, "category"] = "Non Transport"
+                  elif "Transport" in table.loc[i, "type"]:
+                      table.loc[i, "category"] = "Transport"
+              table['category'] = table['category'].ffill()
+              table = table[table["registrations"].str.isnumeric()]
+          else:
+              table.loc[:, "category"] = cat
+              for i in table.index:
+                  # table.loc[i, "type"] = table.loc[i, "type"][table.loc[i, "type"].find(")") + 1:]
+                  table.loc[i, "registrations"] = table.loc[i, "registrations"][table.loc[i, "registrations"].find("l") + 1:].strip().replace(",", "")
+          table.loc[:, "state"] = state
+          table.loc[:, "month"] = month
+          table.loc[:, "year"] = year
+          table = table[columns]
+          table["registrations"] = table["registrations"].astype(int)
+          return table
+
+      def scrape_sequential(target_year, target_month, category):
+          """Process states one by one (more reliable)"""
+          dfs = []
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, slow_mo=50)
+              context = browser.new_context()
+              page = context.new_page()
+              
+              # Navigate to the website
+              print("Navigating to the website...")
+              page.goto("https://vahan.parivahan.gov.in/vahan4dashboard/vahan/dashboardview.xhtml", timeout=60000)
+              page.wait_for_load_state("networkidle")
+              
+              # Get all states
+              print("Getting the list of states...")
+              st_drp_id = get_state_select_ele_id(page)
+              st_drp_ele = f"#{st_drp_id}"
+              
+              # Click to open dropdown
+              page.locator(st_drp_ele).click()
+              page.wait_for_timeout(500)
+              
+              # Get all states from dropdown
+              state_items = page.locator(f"{st_drp_ele}_items li").all()
+              state_labels = [item.inner_text().strip() for item in state_items]
+              
+              # Close dropdown
+              page.keyboard.press("Escape")
+              page.wait_for_timeout(500)
+              
+              print(f"Found {len(state_labels)} states")
+              
+              # Process each state
+              for state_index, state_label in enumerate(state_labels[1:], 1):  # Skip the first "Select" option
+                  state_name = state_label.split("(")[0].strip()
+                  print(f"\nProcessing state {state_index}/{len(state_labels)-1}: {state_name}")
+                  
+                  try:
+                      # Open dropdown and select state
+                      page.locator(st_drp_ele).click()
+                      page.wait_for_timeout(500)
+                      
+                      state_option = page.locator(f"{st_drp_ele}_items li", has_text=state_label)
+                      state_option.click()
+                      page.wait_for_timeout(500)
+                      
+                      # Click search button to refresh data
+                      sub_btn_id = get_submit_btn_id(page)
+                      page.locator(f"#{sub_btn_id}").click()
+                      page.wait_for_timeout(1000)
+                      
+                      # Find and click the target year
+                      print(f"Looking for year {target_year}...")
+                      year_ele = "#pnl_regn_content"
+                      year_items = page.locator(f"{year_ele} a").all()
+                      
+                      year_found = False
+                      for y_item in year_items:
+                          year_text = y_item.inner_text().strip().replace(':', '')
+                          if year_text == target_year:
+                              print(f"Found year {target_year}, clicking...")
+                              y_item.click()
+                              page.wait_for_timeout(1000)
+                              year_found = True
+                              break
+                      
+                      if not year_found:
+                          print(f"Year {target_year} not found for {state_name}, skipping...")
+                          continue
+                      
+                      # Wait for months to load
+                      try:
+                          page.wait_for_selector(".resp-month a", timeout=5000)
+                      except:
+                          print(f"No months found for {state_name}, skipping...")
+                          continue
+                      
+                      # Find and click the target month
+                      print(f"Looking for month {target_month}...")
+                      month_items = page.locator(".resp-month a").all()
+                      
+                      month_found = False
+                      for m_item in month_items:
+                          month_text = m_item.inner_text().strip()
+                          if month_text.lower() == target_month.lower():
+                              print(f"Found month {target_month}, clicking...")
+                              m_item.click()
+                              page.wait_for_timeout(1000)
+                              month_found = True
+                              break
+                      
+                      if not month_found:
+                          print(f"Month {target_month} not found for {state_name}, skipping...")
+                          continue
+                      
+                      # Determine table ID based on category
+                      if category == "vehicle_category":
+                          table_id = "datatable_Catg_data"
+                      elif category == "fuel":
+                          table_id = "datatable_fuel_data"
+                      else:
+                          raise ValueError(f"Invalid category: {category}")
+                      
+                      # Extract data from table
+                      try:
+                          print(f"Extracting data from table...")
+                          raw_table = get_table_text(page, table_id)
+                          if not raw_table:
+                              print(f"No data found in table for {state_name}, skipping...")
+                              continue
+                              
+                          df = pd.DataFrame(raw_table, columns=["type", "registrations"])
+                          data = clean_table(df, state_name, target_year, target_month, cat=category)
+                          
+                          print(f"Successfully extracted {data.shape[0]} rows for {state_name}")
+                          dfs.append(data)
+                      except Exception as e:
+                          print(f"Error extracting data for {state_name}: {e}")
+                          continue
+                          
+                  except Exception as e:
+                      print(f"Error processing state {state_name}: {e}")
+                      continue
+
+              # Close browser
+              context.close()
+              browser.close()
+          
+          # Combine all data
+          if not dfs:
+              print("No data collected!")
+              return pd.DataFrame()
+              
+          combined_data = pd.concat(dfs, ignore_index=True)
+          return combined_data
+
+      # Define process_batch as a top-level function instead of nested
+      def process_batch(batch_states, target_year, target_month, category, state_ele, sub_btn_ele):
+          """Process a batch of states and return collected dataframes"""
+          return_dfs = []
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True, slow_mo=50)
+              context = browser.new_context()
+              page = context.new_page()
+              
+              # Navigate to the website
+              page.goto("https://vahan.parivahan.gov.in/vahan4dashboard/vahan/dashboardview.xhtml", timeout=60000)
+              page.wait_for_load_state("networkidle")
+              
+              # Process each state in the batch
+              for state_label in batch_states:
+                  state_name = state_label.split("(")[0].strip()
+                  print(f"Processing state: {state_name}")
+                  
+                  try:
+                      # Select state
+                      st_drp_ele = f"#{state_ele}"
+                      page.locator(st_drp_ele).click()
+                      page.wait_for_timeout(500)
+                      
+                      state_option = page.locator(f"{st_drp_ele}_items li", has_text=state_label)
+                      state_option.click()
+                      page.wait_for_timeout(500)
+                      
+                      # Click search button
+                      page.locator(f"#{sub_btn_ele}").click()
+                      page.wait_for_timeout(1000)
+                      
+                      # Find and click year
+                      year_ele = "#pnl_regn_content"
+                      year_items = page.locator(f"{year_ele} a").all()
+                      
+                      year_found = False
+                      for y_item in year_items:
+                          year_text = y_item.inner_text().strip().replace(':', '')
+                          if year_text == target_year:
+                              y_item.click()
+                              page.wait_for_timeout(1000)
+                              year_found = True
+                              break
+                      
+                      if not year_found:
+                          continue
+                      
+                      # Wait for months to load
+                      try:
+                          page.wait_for_selector(".resp-month a", timeout=5000)
+                      except:
+                          continue
+                      
+                      # Find and click month
+                      month_items = page.locator(".resp-month a").all()
+                      
+                      month_found = False
+                      for m_item in month_items:
+                          month_text = m_item.inner_text().strip()
+                          if month_text.lower() == target_month.lower():
+                              m_item.click()
+                              page.wait_for_timeout(1000)
+                              month_found = True
+                              break
+                      
+                      if not month_found:
+                          continue
+                      
+                      # Determine table ID
+                      if category == "vehicle_category":
+                          table_id = "datatable_Catg_data"
+                      elif category == "fuel":
+                          table_id = "datatable_fuel_data"
+                      else:
+                          raise ValueError(f"Invalid category: {category}")
+                      
+                      # Extract data
+                      raw_table = get_table_text(page, table_id)
+                      if not raw_table:
+                          continue
+                          
+                      df = pd.DataFrame(raw_table, columns=["type", "registrations"])
+                      data = clean_table(df, state_name, target_year, target_month, cat=category)
+                      
+                      print(f"Extracted {data.shape[0]} rows for {state_name}")
+                      return_dfs.append(data)
+                      
+                  except Exception as e:
+                      print(f"Error processing state {state_name}: {e}")
+                      continue
+              
+              context.close()
+              browser.close()
+              
+          return return_dfs
+
+      def scrape_parallel(target_year, target_month, category, num_workers=4):
+          """Split states into batches and process in parallel"""
+          start_time = time.time()
+          
+          # First get all states
+          with sync_playwright() as p:
+              browser = p.chromium.launch(headless=True)
+              context = browser.new_context()
+              page = context.new_page()
+              
+              page.goto("https://vahan.parivahan.gov.in/vahan4dashboard/vahan/dashboardview.xhtml", timeout=60000)
+              page.wait_for_load_state("networkidle")
+              
+              # Get all states
+              state_ele = get_state_select_ele_id(page)
+              st_drp_ele = f"#{state_ele}"
+              page.locator(st_drp_ele).click()
+              page.wait_for_timeout(500)
+
+              sub_btn_id = get_submit_btn_id(page)
+              
+              state_items = page.locator(f"{st_drp_ele}_items li").all()
+              all_states = [item.inner_text().strip() for item in state_items]
+              
+              context.close()
+              browser.close()
+          
+          # Remove first item (usually "Select")
+          states = all_states[1:]
+          print(f"Found {len(states)} states")
+          
+          # Split states into batches
+          batch_size = len(states) // num_workers
+          if batch_size == 0:
+              batch_size = 1
+              
+          batches = []
+          for i in range(0, len(states), batch_size):
+              batch = states[i:i+batch_size]
+              batches.append(batch)
+          
+          print(f"Split into {len(batches)} batches")
+          
+          # Process batches in parallel
+          results = []
+          with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
+              # Pass all required arguments to the process_batch function
+              futures = [executor.submit(process_batch, batch, target_year, target_month, category, state_ele, sub_btn_id) 
+                        for batch in batches]
+              
+              for future in tqdm(concurrent.futures.as_completed(futures), 
+                                total=len(futures), 
+                                desc="Processing batches", 
+                                file=sys.stdout):
+                  try:
+                      batch_results = future.result()
+                      results.extend(batch_results)
+                  except Exception as e:
+                      print(f"Error processing batch: {e}")
+          
+          # Combine results
+          if not results:
+              print("No data collected!")
+              return pd.DataFrame()
+              
+          combined_data = pd.concat(results, ignore_index=True)
+          print(f"Total time taken: {time.time() - start_time:.2f} seconds")
+          return combined_data
+
+      if __name__ == "__main__":
+          # Ask user which method to use
+          method = os.environ.get("KESTRA_INPUT_SCRAPE_METHOD", "Sequential")
+          target_year = os.environ.get("KESTRA_INPUT_YEAR", "2023")
+          target_month = os.environ.get("KESTRA_INPUT_MONTH", "JAN").upper()
+          category = os.environ.get("KESTRA_INPUT_CATEGORY", "vehicle_category")
+
+          print(f"Using parameters - Method: {method}, Year: {target_year}, Month: {target_month}, Category: {category}")
+          
+          start_time = time.time()
+          
+          if method == "Sequential":
+              print("\nUsing sequential method...")
+              data = scrape_sequential(target_year, target_month, category)
+          else:
+              num_workers = 4
+            #   num_workers = int(input("Enter number of workers (2-8 recommended): "))
+              print(f"\nUsing parallel method with {num_workers} workers...")
+              data = scrape_parallel(target_year, target_month, category, num_workers)
+          
+          print(f"\nTotal time taken: {time.time() - start_time:.2f} seconds")
+          
+          if not data.empty:
+              print("\nData summary:")
+              print(data.info())
+              print(data.head())
+              
+              # # Save to CSV
+              # filename = f"{category.lower().replace(' ', '_')}_{target_year}_{target_month}.csv"
+              # data.to_csv(filename, index=False)
+              # print(f"\nData saved to {filename}")
+              
+              # Show summary statistics
+              print("\nSummary by state:")
+              state_summary = data.groupby('state')['registrations'].sum().sort_values(ascending=False)
+              print(state_summary)
+          else:
+              print("No data to save.")          
+
+          # Convert data for debugging/logging if needed
+          json_data = data.to_dict(orient="records")
+
+          Kestra.outputs({"data": json_data})
+
+  - id: log
+    type: io.kestra.plugin.core.log.Log
+    message: "{{outputs.scrape.vars.data}}"
+
+  - id: write_csv
+    type: io.kestra.plugin.scripts.python.Script
+    beforeCommands:
+      - pip install pandas kestra
+    env:
+      KESTRA_INPUT_YEAR: "{{trigger.date | date('yyyy') | default(inputs.year)}}"
+      KESTRA_INPUT_MONTH: "{{trigger.date | date('MMM') | upper | default(inputs.month)}}"
+      KESTRA_INPUT_CATEGORY: "{{inputs.category}}"
+      KESTRA_OUTPUT_FILE_NAME: "{{render(vars.file)}}"
+    inputFiles: 
+        input.json: "{{outputs.scrape.vars.data | toJson}}"
+    outputFiles:
+        - "{{ render(vars.file) }}"
+    script: |
+      import json
+      import pandas as pd
+      import os
+      from kestra import Kestra
+
+      target_year = os.environ.get("KESTRA_INPUT_YEAR", "2023")
+      target_month = os.environ.get("KESTRA_INPUT_MONTH", "JAN").upper()
+      category = os.environ.get("KESTRA_INPUT_CATEGORY", "vehicle_category")
+
+      with open("input.json") as f:
+        data = json.load(f)
+
+      df = pd.DataFrame(data)
+      filename = os.environ.get("KESTRA_OUTPUT_FILE_NAME", "output.csv")
+      full_path = os.path.join(os.getcwd(), filename)
+      df.to_csv(full_path, index=False)
+      print(df.shape)
+
+      Kestra.outputs({
+            "files": {
+                full_path: full_path
+            }
+        })
+
+  - id: debug_files
+    type: io.kestra.plugin.core.log.Log
+    message: "Available output files: {{ outputs.write_csv.vars.files }}"
+
+  - id: debug_file_refs
+    type: io.kestra.plugin.core.log.Log
+    message: "Output files available: {{ outputs.write_csv.outputFiles | toJson }}"
+
+  - id: debug_filename
+    type: io.kestra.plugin.core.log.Log
+    message: "Trying to upload file: {{ render(vars.file) }}"
+  
+  - id: upload_to_gcs
+    type: io.kestra.plugin.gcp.gcs.Upload
+    from: "{{ outputs.write_csv.outputFiles[render(vars.file)] }}"
+    to: "{{render(vars.gcs_file)}}"
+
+  - id: if_vehicle_category
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{inputs.category == 'vehicle_category'}}"
+    then:
+      - id: bq_vehicle_category_data
+        type: io.kestra.plugin.gcp.bigquery.Query
+        sql: |
+          CREATE TABLE IF NOT EXISTS `{{kv('GCP_PROJECT_ID')}}.{{kv('GCP_DATASET')}}.vehicle_category_data`
+          (
+              unique_row_id BYTES OPTIONS (description = 'A unique identifier for registrations'),
+              filename STRING OPTIONS (description = 'The source filename from which the registration data was loaded.'),
+              year STRING OPTIONS (description = 'Year of registrations'),
+              month STRING OPTIONS (description = 'Month of registration in given year'),
+              state STRING OPTIONS (description = 'State name where registrations done'),
+              type STRING OPTIONS (description = 'Different types of vehicle category'),
+              category STRING OPTIONS (description = 'Registration in category'),
+              registrations INTEGER OPTIONS (description = 'Number of Registrations')
+          );
+      - id: bq_vehicle_category_ext
+        type: io.kestra.plugin.gcp.bigquery.Query
+        sql: |
+          CREATE OR REPLACE EXTERNAL TABLE `{{kv('GCP_PROJECT_ID')}}.{{render(vars.table)}}_ext`
+          (
+            year STRING OPTIONS (description = 'Year of registrations'),
+            month STRING OPTIONS (description = 'Month of registration in given year'),
+            state STRING OPTIONS (description = 'State name where registrations done'),
+            type STRING OPTIONS (description = 'Different types of vehicle category'),
+            category STRING OPTIONS (description = 'Registration in category'),
+            registrations INTEGER OPTIONS (description = 'Number of Registrations')
+          )
+          OPTIONS (
+            format = 'CSV',
+            uris = ['{{render(vars.gcs_file)}}'],
+            skip_leading_rows = 1,
+            ignore_unknown_values = True
+          );
+      - id: bq_vehicle_category_tmp
+        type: io.kestra.plugin.gcp.bigquery.Query
+        sql: |
+          CREATE OR REPLACE TABLE `{{kv('GCP_PROJECT_ID')}}.{{render(vars.table)}}`
+          AS
+          SELECT
+            MD5(CONCAT(
+              COALESCE(CAST(year AS STRING), ""),
+              COALESCE(CAST(month AS STRING), ""),
+              COALESCE(CAST(state AS STRING), ""),
+              COALESCE(CAST(type AS STRING), "")
+              )) AS unique_row_id,
+              "{{render(vars.file)}}" AS filename,
+              *
+          FROM `{{kv('GCP_PROJECT_ID')}}.{{render(vars.table)}}_ext`;
+      - id: bq_vehicle_category_merge
+        type: io.kestra.plugin.gcp.bigquery.Query
+        sql: |
+          MERGE INTO `{{kv('GCP_PROJECT_ID')}}.{{kv('GCP_DATASET')}}.vehicle_category_data` T
+          USING `{{kv('GCP_PROJECT_ID')}}.{{render(vars.table)}}` S
+          ON T.unique_row_id = S.unique_row_id
+          WHEN NOT MATCHED THEN
+            INSERT (unique_row_id, filename, year, month, state, type, category, registrations)
+            VALUES (S.unique_row_id, S.filename, S.year, S.month, S.state, S.type, S.category, S.registrations);
+
+  - id: if_fuel
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{inputs.category == 'fuel'}}"
+    then:
+      - id: bq_fuel_type_data
+        type: io.kestra.plugin.gcp.bigquery.Query
+        sql: |
+          CREATE TABLE IF NOT EXISTS `{{kv('GCP_PROJECT_ID')}}.{{kv('GCP_DATASET')}}.fuel_type_data`
+          (
+              unique_row_id BYTES OPTIONS (description = 'A unique identifier for registrations'),
+              filename STRING OPTIONS (description = 'The source filename from which the registration data was loaded.'),
+              year STRING OPTIONS (description = 'Year of registrations'),
+              month STRING OPTIONS (description = 'Month of registration in given year'),
+              state STRING OPTIONS (description = 'State name where registrations done'),
+              type STRING OPTIONS (description = 'Different category of fuel types'),
+              category STRING OPTIONS (description = 'Registration in category'),
+              registrations INTEGER OPTIONS (description = 'Number of Registrations')
+          );
+      - id: bq_fuel_ext
+        type: io.kestra.plugin.gcp.bigquery.Query
+        sql: |
+          CREATE OR REPLACE EXTERNAL TABLE `{{kv('GCP_PROJECT_ID')}}.{{render(vars.table)}}_ext`
+          (
+            year STRING OPTIONS (description = 'Year of registrations'),
+            month STRING OPTIONS (description = 'Month of registration in given year'),
+            state STRING OPTIONS (description = 'State name where registrations done'),
+            type STRING OPTIONS (description = 'Different category of fuel types'),
+            category STRING OPTIONS (description = 'Registration in category'),
+            registrations INTEGER OPTIONS (description = 'Number of Registrations')
+          )
+          OPTIONS (
+            format = 'CSV',
+            uris = ['{{render(vars.gcs_file)}}'],
+            skip_leading_rows = 1,
+            ignore_unknown_values = True
+          );
+      - id: bq_fuel_type_tmp
+        type: io.kestra.plugin.gcp.bigquery.Query
+        sql: |
+          CREATE OR REPLACE TABLE `{{kv('GCP_PROJECT_ID')}}.{{render(vars.table)}}`
+          AS
+          SELECT
+            MD5(CONCAT(
+              COALESCE(CAST(year AS STRING), ""),
+              COALESCE(CAST(month AS STRING), ""),
+              COALESCE(CAST(state AS STRING), ""),
+              COALESCE(CAST(type AS STRING), "")
+              )) AS unique_row_id,
+              "{{render(vars.file)}}" AS filename,
+              *
+          FROM `{{kv('GCP_PROJECT_ID')}}.{{render(vars.table)}}_ext`;
+      - id: bq_fuel_type_merge
+        type: io.kestra.plugin.gcp.bigquery.Query
+        sql: |
+          MERGE INTO `{{kv('GCP_PROJECT_ID')}}.{{kv('GCP_DATASET')}}.fuel_type_data` T
+          USING `{{kv('GCP_PROJECT_ID')}}.{{render(vars.table)}}` S
+          ON T.unique_row_id = S.unique_row_id
+          WHEN NOT MATCHED THEN
+            INSERT (unique_row_id, filename, year, month, state, type, category, registrations)
+            VALUES (S.unique_row_id, S.filename, S.year, S.month, S.state, S.type, S.category, S.registrations);
+
+  - id: purge_files
+    type: io.kestra.plugin.core.storage.PurgeCurrentExecutionFiles
+    description: If you'd like to explore Kestra outputs, disable it.
+    disabled: false
+
+pluginDefaults:
+  - type: io.kestra.plugin.gcp
+    values:
+      serviceAccount: "{{kv('GCP_CREDS')}}"
+      projectId: "{{kv('GCP_PROJECT_ID')}}"
+      location: "{{kv('GCP_LOCATION')}}"
+      bucket: "{{kv('GCP_BUCKET_NAME')}}"
+
+triggers:
+  - id: vehicle_category_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 6 15 * *"  # Runs at 6 AM on 5th of every month
+    inputs:
+      scrape_method: Parallel
+      category: vehicle_category
+
+  - id: fuel_schedule
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 7 15 * *"  # Runs at 7 AM on 5th of every month
+    inputs:
+      scrape_method: Parallel
+      category: fuel

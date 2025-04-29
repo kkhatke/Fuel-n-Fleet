@@ -192,7 +192,7 @@ Test it out by running `dbt test`
 
 The final insights are presented in an interactive **Looker Studio dashboard**, highlighting India's transition to Electric Vehicles (EVs) over time.
 
-**Dashboard Link**: [FueL & Fleet Trends – Looker Studio](https://lookerstudio.google.com/s/rAG0qKiF7g4)
+**Dashboard Link**: [FueL & Fleet Trends – Looker Studio]([https://lookerstudio.google.com/s/rAG0qKiF7g4](https://lookerstudio.google.com/reporting/7ed8575e-cdd2-4076-becb-517db2f1d123))
 
 ![Dashboard](dashboard.jpg)
 
